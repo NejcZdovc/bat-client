@@ -76,7 +76,7 @@ const Client = function (personaId, options, state) {
 
     state.properties.wallet.keyinfo.seed = seed
   }
-  self.state = underscore.defaults(state || {}, { personaId: personaId, options: self.options, ballots: [], transactions: [] })
+  self.state = underscore.defaults(state || {}, { personaId: personaId, options: self.options, ballots: [], batch: {}, transactions: [] })
   self.logging = []
 
   if (self.options.rulesTestP) {
@@ -206,8 +206,12 @@ Client.prototype.sync = function (callback) {
     if (!ballot.proofBallot) return self._proofBallot(ballot, transaction, callback)
   }
 
-  if (ballots && ballots.length > 0) {
-    return self._batchVote(callback)
+  if (ballots && ballots.length > 0 && (!self.state.batch || self.state.batch.length === 0)) {
+    self._prepareBatch()
+  }
+
+  if (self.state.batch && self.state.batch.length > 0) {
+    return self._voteBatch(callback)
   }
 
   transaction = underscore.find(self.state.transactions, function (transaction) {
@@ -1091,16 +1095,12 @@ Client.prototype._proofBallot = function (ballot, transaction, callback) {
   })
 }
 
-Client.prototype._batchVote = function (callback) {
-  const self = this
-  if (!self.state.ballots) {
-    return callback(new Error('No ballots'))
-  }
-
-  const transactions = self.state.transactions
+Client.prototype._prepareBatch = function () {
+  let batch = {}
+  const transactions = this.state.transactions
   const now = underscore.now()
-  const path = self.options.prefix + '/batch/surveyor/voting'
-  const payload = self.state.ballots.map((ballot) => {
+
+  this.state.ballots.forEach((ballot) => {
     let transaction = underscore.find(transactions, function (transaction) {
       return ((transaction.credential) &&
           (ballot.viewingId === transaction.viewingId) &&
@@ -1111,36 +1111,61 @@ Client.prototype._batchVote = function (callback) {
     if (!transaction.ballots[ballot.publisher]) transaction.ballots[ballot.publisher] = 0
     transaction.ballots[ballot.publisher]++
 
-    return {
+    if (!batch[ballot.publisher]) batch[ballot.publisher] = []
+
+    batch[ballot.publisher].push({
       surveyorId: ballot.prepareBallot.surveyorId,
       proof: ballot.proofBallot.proof
-    }
+    })
   })
 
+  this.state.ballots = []
+  this.state.batch = batch
+}
+
+Client.prototype._voteBatch = function (callback) {
+  const self = this
+  if (!self.state.batch) {
+    return callback(new Error('No batch data'))
+  }
+
+  const path = self.options.prefix + '/batch/surveyor/voting'
+
+  const keys = Object.keys(self.state.batch) || []
+  if (keys.length === 0) {
+    return callback(new Error('No batch data (keys are empty'))
+  }
+
+  const publisher = self.state.batch[keys[0]]
+  let payload
+
+  if (publisher.length > 10) {
+    payload = publisher.splice(0, 10)
+  } else {
+    payload = publisher
+  }
+
   self._retryTrip(self, { path: path, method: 'POST', useProxy: true, payload: payload }, function (err, response, body) {
-    self._log('_batchVote', { method: 'PUT', path: path + '...', errP: !!err })
+    self._log('_voteBatch', { method: 'PUT', path: path + '...', errP: !!err })
     // TODO add error to the specific transaction
     if (err || !body) return callback(err)
 
     body.forEach((vote) => {
       let i
-      for (i = self.state.ballots.length - 1; i >= 0; i--) {
-        if (self.state.ballots[i].surveyorId !== vote.surveyorId) continue
+      for (i = publisher.length - 1; i >= 0; i--) {
+        if (publisher[i].surveyorId !== vote.surveyorId) continue
 
-        self.state.ballots.splice(i, 1)
+        publisher.splice(i, 1)
         break
       }
-
-      if (i < 0) console.log('\n\nunable to find ballot surveyorId=' + vote.surveyorId)
     })
 
-    if (self.state.ballots.length > 0) {
-      // TODO what to do in this case?
-      return callback(new Error('Not all ballots voted'))
+    if (self.state.batch[keys[0]].length === 0) {
+      delete self.state.batch[keys[0]]
     }
 
     const delayTime = random.randomInt({ min: 10 * msecs.second, max: 1 * msecs.minute })
-    self._log('_batchVote', { delayTime: delayTime })
+    self._log('_voteBatch', { delayTime: delayTime })
     callback(null, self.state, delayTime)
   })
 }
