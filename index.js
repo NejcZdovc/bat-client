@@ -20,6 +20,7 @@ const uuid = require('uuid')
 const batPublisher = require('bat-publisher')
 
 const SEED_LENGTH = 32
+const BATCH_SIZE = 10
 const HKDF_SALT = new Uint8Array([ 126, 244, 99, 158, 51, 68, 253, 80, 133, 183, 51, 180, 77, 62, 74, 252, 62, 106, 96, 125, 241, 110, 134, 87, 190, 208, 158, 84, 125, 69, 246, 207, 162, 247, 107, 172, 37, 34, 53, 246, 105, 20, 215, 5, 248, 154, 179, 191, 46, 17, 6, 72, 210, 91, 10, 169, 145, 248, 22, 147, 117, 24, 105, 12 ])
 const LEDGER_SERVERS = {
   'staging': {
@@ -198,7 +199,7 @@ Client.prototype.sync = function (callback) {
     transaction = underscore.find(self.state.transactions, function (transaction) {
       return ((transaction.credential) &&
           (ballot.viewingId === transaction.viewingId) &&
-          ((!ballot.prepareBallot) || (!ballot.delayStamp) || (ballot.delayStamp <= now)))
+          ((!ballot.delayStamp) || (ballot.delayStamp <= now)))
     })
     if (!transaction) continue
 
@@ -206,11 +207,11 @@ Client.prototype.sync = function (callback) {
     if (!ballot.proofBallot) return self._proofBallot(ballot, transaction, callback)
   }
 
-  if (ballots && ballots.length > 0 && (!self.state.batch || self.state.batch.length === 0)) {
-    self._prepareBatch()
+  if (ballots && ballots.length > 0 && (!self.state.batch || Object.keys(self.state.batch).length === 0)) {
+    return self._prepareBatch(callback)
   }
 
-  if (self.state.batch && self.state.batch.length > 0) {
+  if (self.state.batch && Object.keys(self.state.batch).length > 0) {
     return self._voteBatch(callback)
   }
 
@@ -1095,20 +1096,41 @@ Client.prototype._proofBallot = function (ballot, transaction, callback) {
   })
 }
 
-Client.prototype._prepareBatch = function () {
+Client.prototype._prepareBatch = function (callback) {
   let batch = {}
-  const transactions = this.state.transactions
+  const self = this
   const now = underscore.now()
+  const transactions = self.state.transactions
 
-  this.state.ballots.forEach((ballot) => {
+  if (!Array.isArray(self.state.ballots)) {
+    return callback(new Error('Ballots are not an array'))
+  }
+
+  for (let i = self.state.ballots.length - 1; i >= 0; i--) {
+    const ballot = self.state.ballots[i]
     let transaction = underscore.find(transactions, function (transaction) {
-      return ((transaction.credential) &&
-          (ballot.viewingId === transaction.viewingId) &&
-          ((!ballot.prepareBallot) || (!ballot.delayStamp) || (ballot.delayStamp <= now)))
+      return transaction.credential &&
+          ballot.viewingId === transaction.viewingId &&
+          (
+            !ballot.delayStamp ||
+            ballot.delayStamp <= now
+          )
     })
 
-    if (!transaction.ballots) transaction.ballots = {}
-    if (!transaction.ballots[ballot.publisher]) transaction.ballots[ballot.publisher] = 0
+    if (!transaction) continue
+
+    if (!ballot.prepareBallot || !ballot.proofBallot) {
+      return callback(new Error('Ballot is not ready'))
+    }
+
+    if (!transaction.ballots) {
+      transaction.ballots = {}
+    }
+
+    if (!transaction.ballots[ballot.publisher]) {
+      transaction.ballots[ballot.publisher] = 0
+    }
+
     transaction.ballots[ballot.publisher]++
 
     if (!batch[ballot.publisher]) batch[ballot.publisher] = []
@@ -1117,10 +1139,14 @@ Client.prototype._prepareBatch = function () {
       surveyorId: ballot.prepareBallot.surveyorId,
       proof: ballot.proofBallot.proof
     })
-  })
 
-  this.state.ballots = []
-  this.state.batch = batch
+    self.state.ballots.splice(i, 1)
+  }
+
+  self.state.batch = batch
+
+  const delayTime = random.randomInt({ min: 10 * msecs.second, max: 1 * msecs.minute })
+  callback(null, self.state, delayTime)
 }
 
 Client.prototype._voteBatch = function (callback) {
@@ -1139,14 +1165,14 @@ Client.prototype._voteBatch = function (callback) {
   const publisher = self.state.batch[keys[0]]
   let payload
 
-  if (publisher.length > 10) {
-    payload = publisher.splice(0, 10)
+  if (publisher.length > BATCH_SIZE) {
+    payload = publisher.splice(0, BATCH_SIZE)
   } else {
     payload = publisher
   }
 
   self._retryTrip(self, { path: path, method: 'POST', useProxy: true, payload: payload }, function (err, response, body) {
-    self._log('_voteBatch', { method: 'PUT', path: path + '...', errP: !!err })
+    self._log('_voteBatch', { method: 'POST', path: path + '...', errP: !!err })
     // TODO add error to the specific transaction
     if (err || !body) return callback(err)
 
